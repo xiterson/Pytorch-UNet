@@ -1,0 +1,8 @@
+tmux new -s unet_train
+tmux detach
+tmux ls
+tmux a -t unet_train
+# 删除指定会话
+tmux kill-session -t session1
+# 删除所有会话
+tmux kill-server

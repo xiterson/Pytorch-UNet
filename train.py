@@ -51,6 +51,13 @@ def train_model(
     n_train = len(dataset) - n_val
     train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
 
+    # 调试用：限制训练数据量为 debug_limit 组（设为0或None则使用全量数据）
+    debug_limit = 500
+    if debug_limit and debug_limit < len(train_set):
+        from torch.utils.data import Subset
+        train_set = Subset(train_set, range(debug_limit))
+        logging.info(f'DEBUG MODE: 训练集截取为 {debug_limit}/{n_train} 样本')
+
     # 3. Create data loaders
     # 注意：num_workers=0 避免multiprocessing在validation round时与训练worker冲突导致进程退出
     loader_args = dict(batch_size=batch_size, num_workers=0, pin_memory=True)
@@ -201,6 +208,58 @@ if __name__ == '__main__':
     batch_size = 1
     input_size = (batch_size, 3, int(480 * args.scale), int(320 * args.scale))
     summary(model, input_size=input_size, col_names=["input_size", "output_size", "num_params"], verbose=0)
+
+    # 打印并保存模型结构文本（方便AI分析层尺寸）
+    model_text_path = Path('./model_structure.txt')
+    with open(model_text_path, 'w') as f:
+        f.write(f'=== UNet Model Structure ===\n')
+        f.write(f'n_channels={model.n_channels}, n_classes={model.n_classes}, bilinear={model.bilinear}\n')
+        f.write(f'Input size: {input_size}\n\n')
+
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        f.write(f'Total params: {total_params:,}\n')
+        f.write(f'Trainable: {trainable:,}\n\n')
+        f.write('--- Layer Details ---\n')
+
+        for name, module in model.named_modules():
+            prefix = len(name.split('.')) - 1
+            indent = '  ' * max(prefix, 0)
+            module_type = type(module).__name__
+            params = sum(p.numel() for p in module.parameters())
+            f.write(f'{indent}{name or "root"} ({module_type})\n')
+            if hasattr(module, 'in_channels') and hasattr(module, 'out_channels'):
+                k = getattr(module, 'kernel_size', None)
+                s = getattr(module, 'stride', None)
+                p = getattr(module, 'padding', None)
+                extra = f'  [in={module.in_channels}, out={module.out_channels}'
+                if k is not None: extra += f', k={k}'
+                if s is not None: extra += f', s={s}'
+                if p is not None: extra += f', p={p}'
+                extra += ']'
+                f.write(f'{indent}  {extra}\n')
+            elif isinstance(module, (nn.BatchNorm2d, nn.InstanceNorm2d)):
+                f.write(f'{indent}  [features={module.num_features}]\n')
+            if params > 0:
+                f.write(f'{indent}  params: {params:,}\n')
+            f.write('\n')
+
+    logging.info(f'Model structure saved to {model_text_path}')
+    # 同时在终端打印
+    logging.info(model)
+    print(model_text_path.read_text())
+
+    # 使用 torchview 显示 model graph 并保存为文件
+    try:
+        from torchview import draw_graph
+        dummy_input = torch.randn(*input_size)
+        graph = draw_graph(model, input_data=dummy_input,
+                           expand_nested=True, depth=4, save_graph=True)
+        graph_path = str(Path('./model_graph'))
+        graph.visual_graph.render(graph_path, format='png', cleanup=True)
+        logging.info(f'Model graph saved to {graph_path}.png')
+    except Exception as e:
+        logging.warning(f'torchview 可视化失败（不影响训练）: {e}')
 
     if args.load:
         state_dict = torch.load(args.load, map_location=device)

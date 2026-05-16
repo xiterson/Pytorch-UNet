@@ -1,0 +1,1 @@
+python predict.py -i ./data/val_img/val.jpg -o output.jpg -m checkpoints/checkpoint_epoch5.pth
