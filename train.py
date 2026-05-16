@@ -13,9 +13,11 @@ from torch import optim
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
-import wandb
+
+# import wandb  # 暂时注释掉wandb，排查训练退出问题
 from evaluate import evaluate
 from unet import UNet
+from torchinfo import summary
 from utils.data_loading import BasicDataset, CarvanaDataset
 from utils.dice_score import dice_loss
 
@@ -42,7 +44,7 @@ def train_model(
     try:
         dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
     except (AssertionError, RuntimeError, IndexError):
-        dataset = BasicDataset(dir_img, dir_mask, img_scale)
+        dataset = BasicDataset(dir_img, dir_mask, img_scale, mask_suffix='_mask')
 
     # 2. Split into train / validation partitions
     n_val = int(len(dataset) * val_percent)
@@ -50,16 +52,17 @@ def train_model(
     train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
 
     # 3. Create data loaders
-    loader_args = dict(batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=True)
+    # 注意：num_workers=0 避免multiprocessing在validation round时与训练worker冲突导致进程退出
+    loader_args = dict(batch_size=batch_size, num_workers=0, pin_memory=True)
     train_loader = DataLoader(train_set, shuffle=True, **loader_args)
     val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
 
-    # (Initialize logging)
-    experiment = wandb.init(project='U-Net', resume='allow', anonymous='must')
-    experiment.config.update(
-        dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
-             val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp)
-    )
+    # (Initialize logging) - 暂时注释wandb
+    # experiment = wandb.init(project='U-Net', resume='allow')
+    # experiment.config.update(
+    #     dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
+    #          val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp)
+    # )
 
     logging.info(f'''Starting training:
         Epochs:          {epochs}
@@ -77,7 +80,7 @@ def train_model(
     optimizer = optim.RMSprop(model.parameters(),
                               lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
-    grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    grad_scaler = torch.amp.GradScaler(enabled=amp)
     criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
     global_step = 0
 
@@ -110,6 +113,14 @@ def train_model(
                             multiclass=True
                         )
 
+                # NaN 检测：跳过异常 batch，防止 NaN 级联扩散
+                if torch.isnan(loss) or torch.isinf(loss):
+                    logging.warning(f'Step {global_step}: 检测到 NaN/Inf loss ({loss.item})，跳过该 batch')
+                    optimizer.zero_grad(set_to_none=True)
+                    pbar.update(images.shape[0])
+                    global_step += 1
+                    continue
+
                 optimizer.zero_grad(set_to_none=True)
                 grad_scaler.scale(loss).backward()
                 grad_scaler.unscale_(optimizer)
@@ -120,44 +131,28 @@ def train_model(
                 pbar.update(images.shape[0])
                 global_step += 1
                 epoch_loss += loss.item()
-                experiment.log({
-                    'train loss': loss.item(),
-                    'step': global_step,
-                    'epoch': epoch
-                })
+                # experiment.log({
+                #     'train loss': loss.item(),
+                #     'step': global_step,
+                #     'epoch': epoch
+                # })
                 pbar.set_postfix(**{'loss (batch)': loss.item()})
 
                 # Evaluation round
                 division_step = (n_train // (5 * batch_size))
                 if division_step > 0:
                     if global_step % division_step == 0:
-                        histograms = {}
-                        for tag, value in model.named_parameters():
-                            tag = tag.replace('/', '.')
-                            if not (torch.isinf(value) | torch.isnan(value)).any():
-                                histograms['Weights/' + tag] = wandb.Histogram(value.data.cpu())
-                            if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
-                                histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
-
-                        val_score = evaluate(model, val_loader, device, amp)
-                        scheduler.step(val_score)
-
-                        logging.info('Validation Dice score: {}'.format(val_score))
+                        logging.info(f'--- Entering validation round at step {global_step} ---')
                         try:
-                            experiment.log({
-                                'learning rate': optimizer.param_groups[0]['lr'],
-                                'validation Dice': val_score,
-                                'images': wandb.Image(images[0].cpu()),
-                                'masks': {
-                                    'true': wandb.Image(true_masks[0].float().cpu()),
-                                    'pred': wandb.Image(masks_pred.argmax(dim=1)[0].float().cpu()),
-                                },
-                                'step': global_step,
-                                'epoch': epoch,
-                                **histograms
-                            })
-                        except:
-                            pass
+                            val_score = evaluate(model, val_loader, device, amp)
+                            scheduler.step(val_score)
+                            logging.info('Validation Dice score: {}'.format(val_score))
+
+                            # experiment.log({ ... })  # 暂时注释
+                        except Exception as e:
+                            import traceback
+                            logging.error(f'Validation round FAILED:\n{traceback.format_exc()}')
+                            raise
 
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
@@ -202,6 +197,11 @@ if __name__ == '__main__':
                  f'\t{model.n_classes} output channels (classes)\n'
                  f'\t{"Bilinear" if model.bilinear else "Transposed conv"} upscaling')
 
+    # 打印详细的模型结构
+    batch_size = 1
+    input_size = (batch_size, 3, int(480 * args.scale), int(320 * args.scale))
+    summary(model, input_size=input_size, col_names=["input_size", "output_size", "num_params"], verbose=0)
+
     if args.load:
         state_dict = torch.load(args.load, map_location=device)
         del state_dict['mask_values']
@@ -220,6 +220,10 @@ if __name__ == '__main__':
             val_percent=args.val / 100,
             amp=args.amp
         )
+    except Exception as e:
+        import traceback
+        logging.error(f'=== TRAINING CRASHED ===\n{traceback.format_exc()}')
+        raise
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '
                       'Enabling checkpointing to reduce memory usage, but this slows down training. '
@@ -236,3 +240,11 @@ if __name__ == '__main__':
             val_percent=args.val / 100,
             amp=args.amp
         )
+    except Exception as e:
+        import traceback
+        logging.error(f'=== TRAINING CRASHED ===\n{traceback.format_exc()}')
+        raise
+    except Exception as e:
+        import traceback
+        logging.error(f'=== TRAINING CRASHED ===\n{traceback.format_exc()}')
+        raise

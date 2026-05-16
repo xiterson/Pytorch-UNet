@@ -84,13 +84,14 @@ if __name__ == '__main__':
     out_files = get_output_filenames(args)
 
     net = UNet(n_channels=3, n_classes=args.classes, bilinear=args.bilinear)
+    #net=torch.hub.load('milesial/Pytorch-UNet', 'unet_carvana', pretrained=True, scale=0.5)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Loading model {args.model}')
     logging.info(f'Using device {device}')
 
     net.to(device=device)
-    state_dict = torch.load(args.model, map_location=device)
+    state_dict = torch.load(args.model, map_location=device, weights_only=False)
     mask_values = state_dict.pop('mask_values', [0, 1])
     net.load_state_dict(state_dict)
 
