@@ -11,10 +11,9 @@ import torchvision.transforms.functional as TF
 from pathlib import Path
 from torch import optim
 from torch.utils.data import DataLoader, random_split
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-
-# import wandb  # 暂时注释掉wandb，排查训练退出问题
 from evaluate import evaluate
 from unet import UNet
 from torchinfo import summary
@@ -29,7 +28,7 @@ dir_checkpoint = Path('./checkpoints/')
 def train_model(
         model,
         device,
-        epochs: int = 5,
+        epochs: int = 20,
         batch_size: int = 1,
         learning_rate: float = 1e-5,
         val_percent: float = 0.1,
@@ -41,8 +40,7 @@ def train_model(
         gradient_clipping: float = 1.0,
 ):
     # 1. Create dataset
-    # 调试用：限制数据量（在文件列表阶段就限制，避免全量扫描mask）
-    debug_limit = None  # 设为0或None使用全量数据
+    debug_limit = None  # 设为数字限制数据量，设为None使用全量数据
     try:
         dataset = CarvanaDataset(dir_img, dir_mask, img_scale, limit=debug_limit)
     except (AssertionError, RuntimeError, IndexError):
@@ -53,18 +51,14 @@ def train_model(
     n_train = len(dataset) - n_val
     train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
 
-    # 3. Create data loaders
-    # 注意：num_workers=0 避免multiprocessing在validation round时与训练worker冲突导致进程退出
+    # 3. Create data loaders (num_workers=0 避免multiprocessing冲突)
     loader_args = dict(batch_size=batch_size, num_workers=0, pin_memory=True)
     train_loader = DataLoader(train_set, shuffle=True, **loader_args)
     val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
 
-    # (Initialize logging) - 暂时注释wandb
-    # experiment = wandb.init(project='U-Net', resume='allow')
-    # experiment.config.update(
-    #     dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
-    #          val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp)
-    # )
+    # TensorBoard 日志初始化
+    writer = SummaryWriter(log_dir='./runs/unet')
+    logging.info(f'TensorBoard 日志目录: ./runs/unet')
 
     logging.info(f'''Starting training:
         Epochs:          {epochs}
@@ -78,10 +72,22 @@ def train_model(
         Mixed Precision: {amp}
     ''')
 
-    # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
+    # 记录超参数到 TensorBoard
+    writer.add_hparams({
+        'epochs': epochs,
+        'batch_size': batch_size,
+        'lr': learning_rate,
+        'val_percent': val_percent,
+        'img_scale': img_scale,
+        'amp': str(amp),
+        'n_train': n_train,
+        'n_val': n_val,
+    }, metric_dict={})
+
+    # 4. Set up optimizer, scheduler, loss scaler
     optimizer = optim.RMSprop(model.parameters(),
                               lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)
     grad_scaler = torch.amp.GradScaler(enabled=amp)
     criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
     global_step = 0
@@ -96,8 +102,7 @@ def train_model(
 
                 assert images.shape[1] == model.n_channels, \
                     f'Network has been defined with {model.n_channels} input channels, ' \
-                    f'but loaded images have {images.shape[1]} channels. Please check that ' \
-                    'the images are loaded correctly.'
+                    f'but loaded images have {images.shape[1]} channels.'
 
                 images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
                 true_masks = true_masks.to(device=device, dtype=torch.long)
@@ -117,7 +122,7 @@ def train_model(
 
                 # NaN 检测：跳过异常 batch，防止 NaN 级联扩散
                 if torch.isnan(loss) or torch.isinf(loss):
-                    logging.warning(f'Step {global_step}: 检测到 NaN/Inf loss ({loss.item})，跳过该 batch')
+                    logging.warning(f'Step {global_step}: 检测到 NaN/Inf loss，跳过该 batch')
                     optimizer.zero_grad(set_to_none=True)
                     pbar.update(images.shape[0])
                     global_step += 1
@@ -133,28 +138,38 @@ def train_model(
                 pbar.update(images.shape[0])
                 global_step += 1
                 epoch_loss += loss.item()
-                # experiment.log({
-                #     'train loss': loss.item(),
-                #     'step': global_step,
-                #     'epoch': epoch
-                # })
+
+                # TensorBoard: 记录训练 loss
+                writer.add_scalar('train/loss', loss.item(), global_step)
+                writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], global_step)
                 pbar.set_postfix(**{'loss (batch)': loss.item()})
 
                 # Evaluation round
                 division_step = (n_train // (5 * batch_size))
-                if division_step > 0:
-                    if global_step % division_step == 0:
-                        logging.info(f'--- Entering validation round at step {global_step} ---')
-                        try:
-                            val_score = evaluate(model, val_loader, device, amp)
-                            scheduler.step(val_score)
-                            logging.info('Validation Dice score: {}'.format(val_score))
+                if division_step > 0 and global_step % division_step == 0:
+                    try:
+                        val_score = evaluate(model, val_loader, device, amp)
+                        scheduler.step(val_score)
+                        logging.info('Validation Dice score: {:.4f}'.format(val_score))
 
-                            # experiment.log({ ... })  # 暂时注释
-                        except Exception as e:
-                            import traceback
-                            logging.error(f'Validation round FAILED:\n{traceback.format_exc()}')
-                            raise
+                        # TensorBoard: 记录验证指标
+                        writer.add_scalar('val/dice', val_score, global_step)
+                        writer.add_scalar('val/lr', optimizer.param_groups[0]['lr'], global_step)
+
+                        # TensorBoard: 记录预测样本图
+                        writer.add_images('val/images', images, global_step)
+                        writer.add_images('val/masks_true', true_masks.unsqueeze(1).float(), global_step)
+                        pred_mask = masks_pred.argmax(dim=1).unsqueeze(1).float()
+                        writer.add_images('val/masks_pred', pred_mask, global_step)
+
+                    except Exception as e:
+                        import traceback
+                        logging.error(f'Validation round FAILED:\n{traceback.format_exc()}')
+                        raise
+
+        # Epoch 级别统计
+        avg_epoch_loss = epoch_loss / max(n_train, 1)
+        writer.add_scalar('epoch/avg_loss', avg_epoch_loss, epoch)
 
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
@@ -163,10 +178,13 @@ def train_model(
             torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
             logging.info(f'Checkpoint {epoch} saved!')
 
+    writer.close()
+    logging.info('TensorBoard writer closed')
+
 
 def get_args():
     parser = argparse.ArgumentParser(description='Train the UNet on images and target masks')
-    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=5, help='Number of epochs')
+    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=10, help='Number of epochs')
     parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=1, help='Batch size')
     parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-5,
                         help='Learning rate', dest='lr')
@@ -188,9 +206,6 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Using device {device}')
 
-    # Change here to adapt to your data
-    # n_channels=3 for RGB images
-    # n_classes is the number of probabilities you want to get per pixel
     model = UNet(n_channels=3, n_classes=args.classes, bilinear=args.bilinear)
     model = model.to(memory_format=torch.channels_last)
 
@@ -199,8 +214,8 @@ if __name__ == '__main__':
                  f'\t{model.n_classes} output channels (classes)\n'
                  f'\t{"Bilinear" if model.bilinear else "Transposed conv"} upscaling')
 
-    # 打印详细的模型结构
-    batch_size = 1
+    # 打印详细的模型结构 (torchinfo)
+    batch_size = args.batch_size
     input_size = (batch_size, 3, int(480 * args.scale), int(320 * args.scale))
     summary(model, input_size=input_size, col_names=["input_size", "output_size", "num_params"], verbose=0)
 
@@ -240,7 +255,6 @@ if __name__ == '__main__':
             f.write('\n')
 
     logging.info(f'Model structure saved to {model_text_path}')
-    # 同时在终端打印
     logging.info(model)
     print(model_text_path.read_text())
 
@@ -274,10 +288,6 @@ if __name__ == '__main__':
             val_percent=args.val / 100,
             amp=args.amp
         )
-    except Exception as e:
-        import traceback
-        logging.error(f'=== TRAINING CRASHED ===\n{traceback.format_exc()}')
-        raise
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '
                       'Enabling checkpointing to reduce memory usage, but this slows down training. '
@@ -294,10 +304,6 @@ if __name__ == '__main__':
             val_percent=args.val / 100,
             amp=args.amp
         )
-    except Exception as e:
-        import traceback
-        logging.error(f'=== TRAINING CRASHED ===\n{traceback.format_exc()}')
-        raise
     except Exception as e:
         import traceback
         logging.error(f'=== TRAINING CRASHED ===\n{traceback.format_exc()}')
