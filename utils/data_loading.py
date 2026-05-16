@@ -36,7 +36,7 @@ def unique_mask_values(idx, mask_dir, mask_suffix):
 
 
 class BasicDataset(Dataset):
-    def __init__(self, images_dir: str, mask_dir: str, scale: float = 1.0, mask_suffix: str = ''):
+    def __init__(self, images_dir: str, mask_dir: str, scale: float = 1.0, mask_suffix: str = '', limit: int = 0):
         self.images_dir = Path(images_dir)
         self.mask_dir = Path(mask_dir)
         assert 0 < scale <= 1, 'Scale must be between 0 and 1'
@@ -44,6 +44,10 @@ class BasicDataset(Dataset):
         self.mask_suffix = mask_suffix
 
         self.ids = [splitext(file)[0] for file in listdir(images_dir) if isfile(join(images_dir, file)) and not file.startswith('.')]
+        # 调试用：限制数据量（在文件列表阶段就限制，避免全量扫描mask）
+        if limit and limit < len(self.ids):
+            self.ids = self.ids[:limit]
+            logging.info(f'DEBUG MODE: 数据集限制为 {limit}/{len(self.ids)} 样本')
         if not self.ids:
             raise RuntimeError(f'No input file found in {images_dir}, make sure you put your images there')
 
@@ -113,5 +117,5 @@ class BasicDataset(Dataset):
 
 
 class CarvanaDataset(BasicDataset):
-    def __init__(self, images_dir, mask_dir, scale=1):
-        super().__init__(images_dir, mask_dir, scale, mask_suffix='_mask')
+    def __init__(self, images_dir, mask_dir, scale=1, limit=0):
+        super().__init__(images_dir, mask_dir, scale, mask_suffix='_mask', limit=limit)

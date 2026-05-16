@@ -41,22 +41,17 @@ def train_model(
         gradient_clipping: float = 1.0,
 ):
     # 1. Create dataset
+    # 调试用：限制数据量（在文件列表阶段就限制，避免全量扫描mask）
+    debug_limit = None  # 设为0或None使用全量数据
     try:
-        dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
+        dataset = CarvanaDataset(dir_img, dir_mask, img_scale, limit=debug_limit)
     except (AssertionError, RuntimeError, IndexError):
-        dataset = BasicDataset(dir_img, dir_mask, img_scale, mask_suffix='_mask')
+        dataset = BasicDataset(dir_img, dir_mask, img_scale, mask_suffix='_mask', limit=debug_limit)
 
     # 2. Split into train / validation partitions
     n_val = int(len(dataset) * val_percent)
     n_train = len(dataset) - n_val
     train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
-
-    # 调试用：限制训练数据量为 debug_limit 组（设为0或None则使用全量数据）
-    debug_limit = 500
-    if debug_limit and debug_limit < len(train_set):
-        from torch.utils.data import Subset
-        train_set = Subset(train_set, range(debug_limit))
-        logging.info(f'DEBUG MODE: 训练集截取为 {debug_limit}/{n_train} 样本')
 
     # 3. Create data loaders
     # 注意：num_workers=0 避免multiprocessing在validation round时与训练worker冲突导致进程退出
