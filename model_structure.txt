@@ -1,6 +1,6 @@
 === UNet Model Structure ===
 n_channels=3, n_classes=2, bilinear=False
-Input size: (1, 3, 240, 160)
+Input size: (1, 3, 120, 80)
 
 Total params: 31,037,698
 Trainable: 31,037,698
