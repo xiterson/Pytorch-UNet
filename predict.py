@@ -8,23 +8,24 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 
-from utils.data_loading import BasicDataset
+from utils.data_loading import BasicDataset, INPUT_SIZE
 from unet import UNet
 from utils.utils import plot_img_and_mask
 
 def predict_img(net,
                 full_img,
                 device,
-                scale_factor=1,
                 out_threshold=0.5):
     net.eval()
-    img = torch.from_numpy(BasicDataset.preprocess(None, full_img, scale_factor, is_mask=False))
+    orig_h, orig_w = full_img.size[1], full_img.size[0]
+    img = torch.from_numpy(BasicDataset.preprocess(None, full_img, is_mask=False, img_size=INPUT_SIZE))
     img = img.unsqueeze(0)
     img = img.to(device=device, dtype=torch.float32)
 
     with torch.no_grad():
         output = net(img).cpu()
-        output = F.interpolate(output, (full_img.size[1], full_img.size[0]), mode='bilinear')
+        # 将输出mask插值回原始图像尺寸
+        output = F.interpolate(output, (orig_h, orig_w), mode='bilinear')
         if net.n_classes > 1:
             mask = output.argmax(dim=1)
         else:
@@ -44,8 +45,6 @@ def get_args():
     parser.add_argument('--no-save', '-n', action='store_true', help='Do not save the output masks')
     parser.add_argument('--mask-threshold', '-t', type=float, default=0.5,
                         help='Minimum probability value to consider a mask pixel white')
-    parser.add_argument('--scale', '-s', type=float, default=0.5,
-                        help='Scale factor for the input images')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
     parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
     
@@ -83,7 +82,7 @@ if __name__ == '__main__':
     in_files = args.input
     out_files = get_output_filenames(args)
 
-    net = UNet(n_channels=3, n_classes=args.classes, bilinear=args.bilinear)
+    net = UNet(n_channels=1, n_classes=args.classes, bilinear=args.bilinear)
     #net=torch.hub.load('milesial/Pytorch-UNet', 'unet_carvana', pretrained=True, scale=0.5)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -103,7 +102,6 @@ if __name__ == '__main__':
 
         mask = predict_img(net=net,
                            full_img=img,
-                           scale_factor=args.scale,
                            out_threshold=args.mask_threshold,
                            device=device)
 

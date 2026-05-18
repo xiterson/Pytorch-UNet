@@ -17,7 +17,7 @@ from tqdm import tqdm
 from evaluate import evaluate
 from unet import UNet
 from torchinfo import summary
-from utils.data_loading import BasicDataset, CarvanaDataset
+from utils.data_loading import BasicDataset, CarvanaDataset, INPUT_SIZE
 from utils.dice_score import dice_loss
 
 dir_img = Path('./data/imgs/')
@@ -33,18 +33,17 @@ def train_model(
         learning_rate: float = 1e-5,
         val_percent: float = 0.1,
         save_checkpoint: bool = True,
-        img_scale: float = 0.25,
         amp: bool = False,
         weight_decay: float = 1e-8,
         momentum: float = 0.999,
         gradient_clipping: float = 1.0,
 ):
-    # 1. Create dataset
+    # 1. Create dataset（固定输入尺寸）
     debug_limit = None  # 设为数字限制数据量，设为None使用全量数据
     try:
-        dataset = CarvanaDataset(dir_img, dir_mask, img_scale, limit=debug_limit)
+        dataset = CarvanaDataset(dir_img, dir_mask, limit=debug_limit, img_size=INPUT_SIZE)
     except (AssertionError, RuntimeError, IndexError):
-        dataset = BasicDataset(dir_img, dir_mask, img_scale, mask_suffix='_mask', limit=debug_limit)
+        dataset = BasicDataset(dir_img, dir_mask, mask_suffix='_mask', limit=debug_limit, img_size=INPUT_SIZE)
 
     # 2. Split into train / validation partitions
     n_val = int(len(dataset) * val_percent)
@@ -68,7 +67,7 @@ def train_model(
         Validation size: {n_val}
         Checkpoints:     {save_checkpoint}
         Device:          {device.type}
-        Images scaling:  {img_scale}
+        Input size:      {INPUT_SIZE} (固定尺寸)
         Mixed Precision: {amp}
     ''')
 
@@ -78,7 +77,8 @@ def train_model(
         'batch_size': batch_size,
         'lr': learning_rate,
         'val_percent': val_percent,
-        'img_scale': img_scale,
+        'img_size_w': INPUT_SIZE[0],
+        'img_size_h': INPUT_SIZE[1],
         'amp': str(amp),
         'n_train': n_train,
         'n_val': n_val,
@@ -185,11 +185,10 @@ def train_model(
 def get_args():
     parser = argparse.ArgumentParser(description='Train the UNet on images and target masks')
     parser.add_argument('--epochs', '-e', metavar='E', type=int, default=20, help='Number of epochs')
-    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=1, help='Batch size')
+    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=8, help='Batch size')
     parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-5,
                         help='Learning rate', dest='lr')
     parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
-    parser.add_argument('--scale', '-s', type=float, default=0.25, help='Downscaling factor of the images')
     parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
                         help='Percent of the data that is used as validation (0-100)')
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
@@ -206,7 +205,7 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Using device {device}')
 
-    model = UNet(n_channels=3, n_classes=args.classes, bilinear=args.bilinear)
+    model = UNet(n_channels=1, n_classes=args.classes, bilinear=args.bilinear)
     model = model.to(memory_format=torch.channels_last)
 
     logging.info(f'Network:\n'
@@ -216,7 +215,7 @@ if __name__ == '__main__':
 
     # 打印详细的模型结构 (torchinfo)
     batch_size = args.batch_size
-    input_size = (batch_size, 3, int(480 * args.scale), int(320 * args.scale))
+    input_size = (batch_size, 1, INPUT_SIZE[1], INPUT_SIZE[0])  # (B, C, H, W)
     summary(model, input_size=input_size, col_names=["input_size", "output_size", "num_params"], verbose=0)
 
     # 打印并保存模型结构文本（方便AI分析层尺寸）
@@ -284,7 +283,6 @@ if __name__ == '__main__':
             batch_size=args.batch_size,
             learning_rate=args.lr,
             device=device,
-            img_scale=args.scale,
             val_percent=args.val / 100,
             amp=args.amp
         )
@@ -300,11 +298,9 @@ if __name__ == '__main__':
             batch_size=args.batch_size,
             learning_rate=args.lr,
             device=device,
-            img_scale=args.scale,
             val_percent=args.val / 100,
             amp=args.amp
         )
-    except Exception as e:
         import traceback
         logging.error(f'=== TRAINING CRASHED ===\n{traceback.format_exc()}')
         raise

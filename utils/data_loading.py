@@ -13,6 +13,10 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 
+# 固定模型输入尺寸（任何尺寸的图像都resize到此尺寸）
+INPUT_SIZE = (480, 320)  # (width, height)
+
+
 def load_image(filename):
     ext = splitext(filename)[1]
     if ext == '.npy':
@@ -36,9 +40,13 @@ def unique_mask_values(idx, mask_dir, mask_suffix):
 
 
 class BasicDataset(Dataset):
-    def __init__(self, images_dir: str, mask_dir: str, scale: float = 1.0, mask_suffix: str = '', limit: int = 0):
+    def __init__(self, images_dir: str, mask_dir: str, scale: float = 1.0, mask_suffix: str = '', limit: int = 0,
+                 img_size=None):
         self.images_dir = Path(images_dir)
         self.mask_dir = Path(mask_dir)
+        assert img_size is None or (isinstance(img_size, tuple) and len(img_size) == 2), \
+            'img_size must be a tuple of (width, height), e.g. (480, 320)'
+        self.img_size = img_size  # 固定输入尺寸（None则使用scale缩放）
         assert 0 < scale <= 1, 'Scale must be between 0 and 1'
         self.scale = scale
         self.mask_suffix = mask_suffix
@@ -66,9 +74,13 @@ class BasicDataset(Dataset):
         return len(self.ids)
 
     @staticmethod
-    def preprocess(mask_values, pil_img, scale, is_mask):
-        w, h = pil_img.size
-        newW, newH = int(scale * w), int(scale * h)
+    def preprocess(mask_values, pil_img, scale=1.0, is_mask=False, img_size=None):
+        # 优先使用固定尺寸，否则按比例缩放
+        if img_size is not None:
+            newW, newH = img_size
+        else:
+            w, h = pil_img.size
+            newW, newH = int(scale * w), int(scale * h)
         assert newW > 0 and newH > 0, 'Scale is too small, resized images would have no pixel'
         pil_img = pil_img.resize((newW, newH), resample=Image.NEAREST if is_mask else Image.BICUBIC)
         img = np.asarray(pil_img)
@@ -87,7 +99,12 @@ class BasicDataset(Dataset):
             if img.ndim == 2:
                 img = img[np.newaxis, ...]
             else:
-                img = img.transpose((2, 0, 1))
+                # 转为灰度图（单通道）
+                if img.ndim == 3 and img.shape[2] in (3, 4):
+                    img = np.dot(img[..., :3], [0.2989, 0.5870, 0.1140])
+                    img = img[np.newaxis, ...]
+                else:
+                    img = img.transpose((2, 0, 1))
 
             if (img > 1).any():
                 img = img / 255.0
@@ -107,8 +124,8 @@ class BasicDataset(Dataset):
         assert img.size == mask.size, \
             f'Image and mask {name} should be the same size, but are {img.size} and {mask.size}'
 
-        img = self.preprocess(self.mask_values, img, self.scale, is_mask=False)
-        mask = self.preprocess(self.mask_values, mask, self.scale, is_mask=True)
+        img = self.preprocess(self.mask_values, img, self.scale, is_mask=False, img_size=self.img_size)
+        mask = self.preprocess(self.mask_values, mask, self.scale, is_mask=True, img_size=self.img_size)
 
         return {
             'image': torch.as_tensor(img.copy()).float().contiguous(),
@@ -117,5 +134,5 @@ class BasicDataset(Dataset):
 
 
 class CarvanaDataset(BasicDataset):
-    def __init__(self, images_dir, mask_dir, scale=1, limit=0):
-        super().__init__(images_dir, mask_dir, scale, mask_suffix='_mask', limit=limit)
+    def __init__(self, images_dir, mask_dir, scale=1, limit=0, img_size=None):
+        super().__init__(images_dir, mask_dir, scale, mask_suffix='_mask', limit=limit, img_size=img_size)
