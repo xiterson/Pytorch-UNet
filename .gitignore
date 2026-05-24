@@ -10,3 +10,6 @@ venv/
 wandb/
 .vscode/
 runs/
+*.txt
+*.gv
+

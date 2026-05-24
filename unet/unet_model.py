@@ -10,7 +10,7 @@ class UNet(nn.Module):
         self.n_classes = n_classes
         self.bilinear = bilinear
 
-        base_ch = 32  # 基础通道数（原为64，减半以减少参数量）
+        base_ch = 8  # 基础通道数（原为64，减半以减少参数量）
         self.inc = (DoubleConv(n_channels, base_ch))
         self.down1 = (Down(base_ch, base_ch * 2))
         self.down2 = (Down(base_ch * 2, base_ch * 4))
@@ -28,7 +28,7 @@ class UNet(nn.Module):
         x2 = self.down1(x1)
         x3 = self.down2(x2)
         x4 = self.down3(x3)
-        x5 = self.down4(x4)
+        x5 = self.down4(x4)  #bottleneck
         x = self.up1(x5, x4)
         x = self.up2(x, x3)
         x = self.up3(x, x2)

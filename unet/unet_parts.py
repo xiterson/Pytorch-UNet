@@ -46,6 +46,8 @@ class Up(nn.Module):
         super().__init__()
 
         # if bilinear, use the normal convolutions to reduce the number of channels
+        # if bilinear, reduce the params of convTranspose2d.but more channel for doubleconv.but have other good effect
+
         if bilinear:
             self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
             self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
